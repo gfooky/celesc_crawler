@@ -1,3 +1,4 @@
+import os
 import re
 import sys
 import json
@@ -30,7 +31,7 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                 pass
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=True) # Mude para False se quiser ver o robô trabalhando
         context = browser.new_context()
         page = context.new_page()
 
@@ -127,8 +128,6 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                     nome_parceiro = parceiro.get("partnerName")
                     print(f"  -> Acessando parceiro: {num_parceiro} - {nome_parceiro}")
 
-                    # Se a gente testou um parceiro e a URL mudou para /contrato/selecao, 
-                    # voltamos para a raiz para testar o próximo
                     if "selecao-acesso" not in page.url:
                         page.goto("https://conecte.celesc.com.br/autenticacao/selecao-acesso")
                         page.wait_for_timeout(2000)
@@ -152,7 +151,7 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                         print(f"     [AVISO] Parceiro {num_parceiro} não apareceu na tela.")
                         continue
 
-                    # Clica no parceiro e INTERCEPTA o json allContracts daquele momento
+                    # Clica no parceiro e INTERCEPTA o json allContracts
                     with page.expect_response(lambda r: "graphql" in r.url and "allContracts" in (r.request.post_data or ""), timeout=15000) as resp:
                         caixa_parceiro.get_by_role("button", name="Selecionar").click()
 
@@ -162,7 +161,6 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                         pass
                     page.wait_for_timeout(2000)
 
-                    # Verifica o JSON que acabou de ser baixado!
                     try:
                         json_contratos = resp.value.json()
                         dados_contratos = json_contratos.get("data", {}).get("allContracts", {}).get("contracts", [])
@@ -187,13 +185,12 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                 print(f"[OK] SUCESSO! UC {unidade_desejada} encontrada no JSON inicial.")
                 uc_encontrada = True
 
-        # Se terminamos tudo e não achou
         if not uc_encontrada:
             print(f"\n[ERRO FATAL] A UC '{unidade_desejada}' não existe nesta conta.")
             sys.exit(1)
 
         # ---------------------------------------------------------
-        # PASSO 4: Abertura da Unidade Consumidora e Download
+        # PASSO 4: Abertura da Unidade Consumidora e Tratamento de Popup
         # ---------------------------------------------------------
         print(f"\nAcessando o painel da UC {unidade_desejada}...")
         caixa_alvo = page.locator("div").filter(has_text=unidade_desejada).filter(has=page.get_by_role("button", name="Selecionar unidade")).last
@@ -202,24 +199,16 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
 
         print("Aguardando o sistema registrar a sessão e carregando o painel...")
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(3000) # Um segundo extra por causa daquele "loader" que vimos no log
+        page.wait_for_timeout(3000) 
 
-        # ---------------------------------------------------------
-        # NOVO: Tratamento do Popup de Fatura Digital
-        # ---------------------------------------------------------
         try:
-            # Procura pelo texto exato na tela
             botao_agora_nao = page.get_by_text("Agora não", exact=True)
-            
-            # Espera até 5 segundos para ver se o popup dá as caras
             if botao_agora_nao.is_visible(timeout=5000):
                 print("[INFO] Popup 'Simplifique sua vida' detectado na tela. Fechando...")
                 botao_agora_nao.click()
-                page.wait_for_timeout(1000) # Pausa rápida para a animação do popup sumir
+                page.wait_for_timeout(1000) 
         except Exception:
-            # Se der timeout e o botão não aparecer, ele ignora silenciosamente e segue a vida
             pass
-        # ---------------------------------------------------------
 
         print("Acessando o Histórico de Faturas via menu...")
         page.get_by_role("button", name=re.compile("Histórico de faturas", re.IGNORECASE)).first.click()
@@ -229,10 +218,10 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
         quantidade = len(linhas_faturas)
 
         # ---------------------------------------------------------
-        # Loop de Download (Com sistema de tentativas / Retry)
+        # PASSO 5: Loop de Download (Modo Incremental + Retry)
         # ---------------------------------------------------------
         if quantidade > 0:
-            print(f"\nIniciando o download de {quantidade} faturas...")
+            print(f"\nVerificando {quantidade} faturas no histórico...")
 
             for i in range(quantidade):
                 linha_alvo = page.locator("ui-celesc-table-row").nth(i)
@@ -243,6 +232,12 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                 data_vencimento = match_data.group(1).replace("/", "-") if match_data else "DataDesconhecida"
 
                 nome_arquivo = f"./Fatura_{unidade_desejada}_{mes}_{data_vencimento}.pdf"
+                
+                if os.path.exists(nome_arquivo):
+                    print(f"[{i+1}/{quantidade}] Fatura de {mes} já existe na pasta. Pulando...")
+                    continue 
+                # ---------------------------------------
+
                 print(f"[{i+1}/{quantidade}] Baixando {mes} (Venc: {data_vencimento})...")
 
                 botao_pagar = linha_alvo.get_by_role("button", name="Pagar")
@@ -252,11 +247,9 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                     botao_pagar.click()
                     page.wait_for_timeout(1000)
 
-                    # Tenta baixar até 3 vezes
                     sucesso = False
                     for tentativa in range(3):
                         try:
-                            # Reduzimos o timeout para 15 segundos por tentativa
                             with page.expect_download(timeout=15000) as informacoes_download:
                                 page.get_by_role("button", name="receipt Gerar 2ª via").click(force=True)
 
@@ -264,10 +257,10 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                             download.save_as(nome_arquivo)
                             print(f"  -> Salvo: {nome_arquivo}")
                             sucesso = True
-                            break # Deu certo, sai do loop de tentativas
+                            break 
                         except Exception:
                             print(f"  [AVISO] Servidor demorou ou falhou. Tentativa {tentativa + 2} de 3...")
-                            page.wait_for_timeout(2000) # Pausa antes de tentar clicar de novo
+                            page.wait_for_timeout(2000) 
                             
                     if not sucesso:
                         print(f"  [ERRO] Pulando a fatura de {mes} após 3 tentativas falhas.")
@@ -279,7 +272,6 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                 else:
                     print("  -> Fatura paga. Baixando direto...")
                     
-                    # Tenta baixar até 3 vezes
                     sucesso = False
                     for tentativa in range(3):
                         try:
@@ -290,17 +282,17 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                             download.save_as(nome_arquivo)
                             print(f"  -> Salvo: {nome_arquivo}")
                             sucesso = True
-                            break # Deu certo, sai do loop de tentativas
+                            break 
                         except Exception:
                             print(f"  [AVISO] Servidor demorou ou falhou. Tentativa {tentativa + 2} de 3...")
-                            page.wait_for_timeout(2000) # Pausa antes de tentar clicar de novo
+                            page.wait_for_timeout(2000) 
 
                     if not sucesso:
                         print(f"  [ERRO] Pulando a fatura de {mes} após 3 tentativas falhas.")
 
                 page.wait_for_timeout(1000)
 
-            print("\n*** TODOS OS DOWNLOADS CONCLUÍDOS COM SUCESSO! ***")
+            print("\n*** VERIFICAÇÃO CONCLUÍDA! ***")
 
         else:
             print("Nenhuma fatura encontrada para baixar.")
