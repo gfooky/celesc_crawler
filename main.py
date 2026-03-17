@@ -35,7 +35,6 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
         context = browser.new_context()
         page = context.new_page()
 
-        # Ativa o listener para capturar os JSONs de forma assíncrona
         page.on("response", interceptador_graphql)
 
         print("Acessando a página da Celesc...")
@@ -81,12 +80,12 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
         except Exception:
             pass
             
-        page.wait_for_timeout(3000) # Tempo para o listener processar os JSONs iniciais
+        page.wait_for_timeout(3000)
         url_atual = page.url
         uc_encontrada = False
 
         # ---------------------------------------------------------
-        # PASSO 3A: Lógica para Múltiplos Perfis (selecao-acesso)
+        # PASSO 3A: Lógica para Múltiplos Perfis (A, B e Imobiliária)
         # ---------------------------------------------------------
         if "selecao-acesso" in url_atual:
             num_parceiros = len(dados_globais['perfil'])
@@ -96,11 +95,10 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                 print("[ERRO] JSON de perfis vazio. Não é possível prosseguir.")
                 sys.exit(1)
 
-            # Separa os parceiros pelos grupos definidos no JSON
             parceiros_grpa = [p for p in dados_globais["perfil"] if p.get("categoryId") == "GRPA"]
             parceiros_grpb = [p for p in dados_globais["perfil"] if p.get("categoryId") == "GRPB"]
+            parceiros_imob = [p for p in dados_globais["perfil"] if p.get("categoryId") == "IMOB"]
 
-            # Estrutura com os SEUS locadores exatos
             grupos_para_verificar = []
             if parceiros_grpa:
                 grupos_para_verificar.append((
@@ -114,13 +112,71 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                     page.locator("celesc-profile-card").filter(has_text="person_outline Para você e").get_by_role("button"),
                     parceiros_grpb
                 ))
+            if parceiros_imob:
+                grupos_para_verificar.append((
+                    "Imobiliária",
+                    page.locator("celesc-profile-card").filter(has_text="home_work Imobiliária Perfil").get_by_role("button"),
+                    parceiros_imob
+                ))
 
-            # Itera sobre os Menus
             for nome_grupo, btn_grupo, parceiros in grupos_para_verificar:
                 if uc_encontrada: break
                 print(f"\n--- Abrindo o menu '{nome_grupo}' ---")
 
-                # Itera sobre os parceiros do menu
+                if "selecao-acesso" not in page.url:
+                    page.goto("https://conecte.celesc.com.br/autenticacao/selecao-acesso")
+                    page.wait_for_timeout(2000)
+
+                if btn_grupo.is_visible():
+                    btn_grupo.click()
+                    page.wait_for_timeout(1500)
+                else:
+                    print(f"  [AVISO] Botão do perfil '{nome_grupo}' não está visível.")
+                    continue
+
+                # =========================================================
+                # FLUXO EXCLUSIVO: IMOBILIÁRIA
+                # =========================================================
+                if nome_grupo == "Imobiliária":
+                    print("  -> Navegando no layout exclusivo de Imobiliária...")
+                    try:
+                        page.wait_for_url("**/contrato/selecao", timeout=15000)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(2000)
+
+                    # Se a tela pedir para pesquisar, nós pesquisamos!
+                    if page.get_by_role("button", name="search Pesquisar").is_visible():
+                        print("  -> Botão 'Pesquisar' detectado. Acionando busca...")
+                        try:
+                            with page.expect_response(lambda r: "graphql" in r.url and "allContracts" in (r.request.post_data or ""), timeout=15000) as resp:
+                                page.get_by_role("button", name="search Pesquisar").click()
+                            
+                            page.wait_for_timeout(2000)
+                            json_contratos = resp.value.json()
+                            dados_contratos = json_contratos.get("data", {}).get("allContracts", {}).get("contracts", [])
+                            if dados_contratos is None: dados_contratos = []
+
+                            if any(c.get('installation') == unidade_desejada for c in dados_contratos):
+                                print(f"  [OK] SUCESSO! UC {unidade_desejada} encontrada na Imobiliária.")
+                                uc_encontrada = True
+                                break
+                            else:
+                                print(f"  [X] UC não encontrada nas unidades da Imobiliária.")
+                        except Exception as e:
+                            print(f"  [ERRO] Falha ao pesquisar contratos da Imobiliária: {e}")
+                    else:
+                        print("  -> Lista de imóveis já carregada. Verificando...")
+                        if page.locator("div").filter(has_text=unidade_desejada).is_visible():
+                            print(f"  [OK] SUCESSO! UC {unidade_desejada} encontrada na Imobiliária.")
+                            uc_encontrada = True
+                            break
+                    
+                    # Se não achou na Imobiliária, ele pula pro próximo grupo (A ou B)
+                    continue
+                # =========================================================
+
+                # Fluxo Normal (Grupo A e B)
                 for parceiro in parceiros:
                     if uc_encontrada: break
 
@@ -131,16 +187,12 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                     if "selecao-acesso" not in page.url:
                         page.goto("https://conecte.celesc.com.br/autenticacao/selecao-acesso")
                         page.wait_for_timeout(2000)
+                        if btn_grupo.is_visible():
+                            btn_grupo.click()
+                            page.wait_for_timeout(1500)
 
-                    # Clica no botão do Grupo (A ou B) se ele estiver recolhido
-                    if btn_grupo.is_visible():
-                        btn_grupo.click()
-                        page.wait_for_timeout(1500)
-
-                    # Localiza o botão "Selecionar" daquele parceiro específico
                     caixa_parceiro = page.locator("div").filter(has_text=num_parceiro).filter(has=page.get_by_role("button", name="Selecionar")).last
 
-                    # Rola a tela (Virtual Scrolling) até o parceiro aparecer
                     tentativas = 0
                     while not caixa_parceiro.is_visible() and tentativas < 5:
                         page.mouse.wheel(0, 1000)
@@ -151,7 +203,6 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                         print(f"     [AVISO] Parceiro {num_parceiro} não apareceu na tela.")
                         continue
 
-                    # Clica no parceiro e INTERCEPTA o json allContracts
                     with page.expect_response(lambda r: "graphql" in r.url and "allContracts" in (r.request.post_data or ""), timeout=15000) as resp:
                         caixa_parceiro.get_by_role("button", name="Selecionar").click()
 
@@ -176,11 +227,10 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                         print(f"     [ERRO] Falha ao processar allContracts: {e}")
 
         # ---------------------------------------------------------
-        # PASSO 3B: Lógica para Conta Simples (contrato/selecao)
+        # PASSO 3B: Lógica para Conta Simples
         # ---------------------------------------------------------
         elif "contrato/selecao" in url_atual:
             print("[INFO] Tela direta de contratos. Verificando JSON allContracts inicial...")
-            
             if any(c.get('installation') == unidade_desejada for c in dados_globais["contratos_iniciais"]):
                 print(f"[OK] SUCESSO! UC {unidade_desejada} encontrada no JSON inicial.")
                 uc_encontrada = True
@@ -190,12 +240,20 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
             sys.exit(1)
 
         # ---------------------------------------------------------
-        # PASSO 4: Abertura da Unidade Consumidora e Tratamento de Popup
+        # PASSO 4: Abertura da UC (Detector Inteligente de Botões)
         # ---------------------------------------------------------
         print(f"\nAcessando o painel da UC {unidade_desejada}...")
-        caixa_alvo = page.locator("div").filter(has_text=unidade_desejada).filter(has=page.get_by_role("button", name="Selecionar unidade")).last
+        
+        # Detector automático: Descobre se o botão se chama 'unidade' ou 'instalação'
+        texto_botao_acesso = "Selecionar unidade"
+        
+        # CORREÇÃO AQUI: Adicionado o .last antes do is_visible()
+        if page.locator("div").filter(has_text=unidade_desejada).filter(has=page.get_by_role("button", name="Selecionar instalação")).last.is_visible():
+            texto_botao_acesso = "Selecionar instalação"
+
+        caixa_alvo = page.locator("div").filter(has_text=unidade_desejada).filter(has=page.get_by_role("button", name=texto_botao_acesso)).last
         caixa_alvo.scroll_into_view_if_needed()
-        caixa_alvo.get_by_role("button", name="Selecionar unidade").last.click()
+        caixa_alvo.get_by_role("button", name=texto_botao_acesso).last.click()
 
         print("Aguardando o sistema registrar a sessão e carregando o painel...")
         page.wait_for_load_state("networkidle")
@@ -218,7 +276,7 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
         quantidade = len(linhas_faturas)
 
         # ---------------------------------------------------------
-        # PASSO 5: Loop de Download (Modo Incremental + Retry)
+        # PASSO 5: Loop de Download
         # ---------------------------------------------------------
         if quantidade > 0:
             print(f"\nVerificando {quantidade} faturas no histórico...")
@@ -236,10 +294,8 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                 if os.path.exists(nome_arquivo):
                     print(f"[{i+1}/{quantidade}] Fatura de {mes} já existe na pasta. Pulando...")
                     continue 
-                # ---------------------------------------
 
                 print(f"[{i+1}/{quantidade}] Baixando {mes} (Venc: {data_vencimento})...")
-
                 botao_pagar = linha_alvo.get_by_role("button", name="Pagar")
 
                 if botao_pagar.is_visible():
