@@ -4,7 +4,7 @@ import sys
 import json
 from playwright.sync_api import sync_playwright
 
-def baixar_faturas_celesc(email, senha, unidade_desejada):
+def baixar_faturas_celesc(email, senha, unidade_desejada, on_fatura_encontrada=None, on_fatura_baixada=None):
     # Dicionário global para armazenar os JSONs capturados em background
     dados_globais = {
         "perfil": [], 
@@ -289,21 +289,28 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                 match_data = re.search(r"Vencimento: (\d{2}/\d{2}/\d{4})", texto_linha)
                 data_vencimento = match_data.group(1).replace("/", "-") if match_data else "DataDesconhecida"
 
-                nome_arquivo = f"./Fatura_{unidade_desejada}_{mes}_{data_vencimento}.pdf"
+                if on_fatura_encontrada:
+                    on_fatura_encontrada(mes, data_vencimento)
+
+                mes_limpo = mes.replace("/", "-")
+                nome_arquivo = f"./Fatura_{unidade_desejada}_{mes_limpo}_{data_vencimento}.pdf"
                 
                 if os.path.exists(nome_arquivo):
                     print(f"[{i+1}/{quantidade}] Fatura de {mes} já existe na pasta. Pulando...")
+                    if on_fatura_baixada:
+                        on_fatura_baixada(mes, True)
                     continue 
 
                 print(f"[{i+1}/{quantidade}] Baixando {mes} (Venc: {data_vencimento})...")
                 botao_pagar = linha_alvo.get_by_role("button", name="Pagar")
+                
+                sucesso = False
 
                 if botao_pagar.is_visible():
                     print("  -> Fatura em aberto. Abrindo opções...")
                     botao_pagar.click()
                     page.wait_for_timeout(1000)
 
-                    sucesso = False
                     for tentativa in range(3):
                         try:
                             with page.expect_download(timeout=15000) as informacoes_download:
@@ -328,7 +335,6 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
                 else:
                     print("  -> Fatura paga. Baixando direto...")
                     
-                    sucesso = False
                     for tentativa in range(3):
                         try:
                             with page.expect_download(timeout=15000) as informacoes_download:
@@ -345,6 +351,9 @@ def baixar_faturas_celesc(email, senha, unidade_desejada):
 
                     if not sucesso:
                         print(f"  [ERRO] Pulando a fatura de {mes} após 3 tentativas falhas.")
+
+                if on_fatura_baixada:
+                    on_fatura_baixada(mes, sucesso)
 
                 page.wait_for_timeout(1000)
 
