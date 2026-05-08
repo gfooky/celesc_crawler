@@ -66,10 +66,10 @@ def baixar_faturas_celesc(email, senha, unidade_desejada, on_fatura_encontrada=N
             else:
                 erro_msg = auth_data.get("message", "Credenciais incorretas!")
                 print(f"[ERRO API] Falha no login: {erro_msg}")
-                sys.exit(1)
-        except Exception:
+                raise ValueError(f"[ERRO API] Falha no login: {erro_msg}")
+        except Exception as e:
             print("[ERRO API] Erro ao analisar login.")
-            sys.exit(1)
+            raise ValueError(f"[ERRO API] Falha no login: {e}")
 
         # ---------------------------------------------------------
         # PASSO 2: Verificação da URL
@@ -93,7 +93,7 @@ def baixar_faturas_celesc(email, senha, unidade_desejada, on_fatura_encontrada=N
 
             if num_parceiros == 0:
                 print("[ERRO] JSON de perfis vazio. Não é possível prosseguir.")
-                sys.exit(1)
+                raise ValueError("[ERRO] JSON de perfis vazio. Não é possível prosseguir.")
 
             parceiros_grpa = [p for p in dados_globais["perfil"] if p.get("categoryId") == "GRPA"]
             parceiros_grpb = [p for p in dados_globais["perfil"] if p.get("categoryId") == "GRPB"]
@@ -175,6 +175,20 @@ def baixar_faturas_celesc(email, senha, unidade_desejada, on_fatura_encontrada=N
                     # Se não achou na Imobiliária, ele pula pro próximo grupo (A ou B)
                     continue
                 # =========================================================
+                
+                # =========================================================
+                # NOVO: DETECTOR DE PULO DE TELA (AUTO-LOAD)
+                # =========================================================
+                # Se o grupo tem apenas 1 parceiro, a Celesc pula os cartões 
+                # e joga as UCs direto na tela. Vamos interceptar isso!
+                print("  -> Verificando se as UCs carregaram automaticamente...")
+                page.wait_for_timeout(1500) # Tempo para as UCs renderizarem
+                
+                if page.locator("div").filter(has_text=unidade_desejada).last.is_visible():
+                    print(f"  [OK] SUCESSO! A Celesc pulou os parceiros e a UC {unidade_desejada} já está aqui.")
+                    uc_encontrada = True
+                    break # Sai do loop de grupos e vai direto acessar a UC no PASSO 4!
+                # =========================================================
 
                 # Fluxo Normal (Grupo A e B)
                 for parceiro in parceiros:
@@ -237,7 +251,7 @@ def baixar_faturas_celesc(email, senha, unidade_desejada, on_fatura_encontrada=N
 
         if not uc_encontrada:
             print(f"\n[ERRO FATAL] A UC '{unidade_desejada}' não existe nesta conta.")
-            sys.exit(1)
+            raise ValueError(f"[ERRO FATAL] A UC '{unidade_desejada}' não existe nesta conta.")
 
         # ---------------------------------------------------------
         # PASSO 4: Abertura da UC (Detector Inteligente de Botões)
@@ -276,86 +290,94 @@ def baixar_faturas_celesc(email, senha, unidade_desejada, on_fatura_encontrada=N
         quantidade = len(linhas_faturas)
 
         # ---------------------------------------------------------
-        # PASSO 5: Loop de Download
+        # PASSO 5: Loop de Download (COM FREIO DE 6 MESES)
         # ---------------------------------------------------------
         if quantidade > 0:
-            print(f"\nVerificando {quantidade} faturas no histórico...")
+            limite_faturas = min(quantidade, 6) # <--- FREIO AQUI
+            print(f"\nVerificando as últimas {limite_faturas} faturas no histórico...")
 
-            for i in range(quantidade):
-                linha_alvo = page.locator("ui-celesc-table-row").nth(i)
-                texto_linha = linha_alvo.inner_text()
-
-                mes = texto_linha.split()[0]
-                match_data = re.search(r"Vencimento: (\d{2}/\d{2}/\d{4})", texto_linha)
-                data_vencimento = match_data.group(1).replace("/", "-") if match_data else "DataDesconhecida"
-
-                if on_fatura_encontrada:
-                    on_fatura_encontrada(mes, data_vencimento)
-
-                mes_limpo = mes.replace("/", "-")
-                nome_arquivo = f"./Fatura_{unidade_desejada}_{mes_limpo}_{data_vencimento}.pdf"
-                
-                if os.path.exists(nome_arquivo):
-                    print(f"[{i+1}/{quantidade}] Fatura de {mes} já existe na pasta. Pulando...")
-                    if on_fatura_baixada:
-                        on_fatura_baixada(mes, True)
-                    continue 
-
-                print(f"[{i+1}/{quantidade}] Baixando {mes} (Venc: {data_vencimento})...")
-                botao_pagar = linha_alvo.get_by_role("button", name="Pagar")
-                
-                sucesso = False
-
-                if botao_pagar.is_visible():
-                    print("  -> Fatura em aberto. Abrindo opções...")
-                    botao_pagar.click()
-                    page.wait_for_timeout(1000)
-
-                    for tentativa in range(3):
-                        try:
-                            with page.expect_download(timeout=15000) as informacoes_download:
-                                page.get_by_role("button", name="receipt Gerar 2ª via").click(force=True)
-
-                            download = informacoes_download.value
-                            download.save_as(nome_arquivo)
-                            print(f"  -> Salvo: {nome_arquivo}")
-                            sucesso = True
-                            break 
-                        except Exception:
-                            print(f"  [AVISO] Servidor demorou ou falhou. Tentativa {tentativa + 2} de 3...")
-                            page.wait_for_timeout(2000) 
-                            
-                    if not sucesso:
-                        print(f"  [ERRO] Pulando a fatura de {mes} após 3 tentativas falhas.")
-
-                    page.keyboard.press("Escape")
-                    page.mouse.click(10, 10)
-                    page.wait_for_timeout(1000)
-
-                else:
-                    print("  -> Fatura paga. Baixando direto...")
+            for i in range(limite_faturas): # <--- FREIO AQUI
+                try:
+                    linha_alvo = page.locator("ui-celesc-table-row").nth(i)
                     
-                    for tentativa in range(3):
-                        try:
-                            with page.expect_download(timeout=15000) as informacoes_download:
-                                linha_alvo.get_by_role("button", name=re.compile("Gerar 2ª via", re.IGNORECASE)).click(force=True)
+                    texto_linha = linha_alvo.inner_text(timeout=5000)
 
-                            download = informacoes_download.value
-                            download.save_as(nome_arquivo)
-                            print(f"  -> Salvo: {nome_arquivo}")
-                            sucesso = True
-                            break 
-                        except Exception:
-                            print(f"  [AVISO] Servidor demorou ou falhou. Tentativa {tentativa + 2} de 3...")
-                            page.wait_for_timeout(2000) 
+                    mes = texto_linha.split()[0]
+                    match_data = re.search(r"Vencimento: (\d{2}/\d{2}/\d{4})", texto_linha)
+                    data_vencimento = match_data.group(1).replace("/", "-") if match_data else "DataDesconhecida"
 
-                    if not sucesso:
-                        print(f"  [ERRO] Pulando a fatura de {mes} após 3 tentativas falhas.")
+                    if on_fatura_encontrada:
+                        on_fatura_encontrada(mes, data_vencimento)
 
-                if on_fatura_baixada:
-                    on_fatura_baixada(mes, sucesso)
+                    mes_limpo = mes.replace("/", "-")
+                    nome_arquivo = f"./Fatura_{unidade_desejada}_{mes_limpo}_{data_vencimento}.pdf"
+                    
+                    if os.path.exists(nome_arquivo):
+                        print(f"[{i+1}/{quantidade}] Fatura de {mes} já existe na pasta. Pulando...")
+                        if on_fatura_baixada:
+                            on_fatura_baixada(mes, True)
+                        continue 
 
-                page.wait_for_timeout(1000)
+                    print(f"[{i+1}/{quantidade}] Baixando {mes} (Venc: {data_vencimento})...")
+                    botao_pagar = linha_alvo.get_by_role("button", name="Pagar")
+                    
+                    sucesso = False
+
+                    if botao_pagar.is_visible():
+                        print("  -> Fatura em aberto. Abrindo opções...")
+                        botao_pagar.click()
+                        page.wait_for_timeout(1000)
+
+                        for tentativa in range(3):
+                            try:
+                                with page.expect_download(timeout=15000) as informacoes_download:
+                                    page.get_by_role("button", name="receipt Gerar 2ª via").click(force=True)
+
+                                download = informacoes_download.value
+                                download.save_as(nome_arquivo)
+                                print(f"  -> Salvo: {nome_arquivo}")
+                                sucesso = True
+                                break 
+                            except Exception:
+                                print(f"  [AVISO] Servidor demorou ou falhou. Tentativa {tentativa + 2} de 3...")
+                                page.wait_for_timeout(2000) 
+                                
+                        if not sucesso:
+                            print(f"  [ERRO] Pulando a fatura de {mes} após 3 tentativas falhas.")
+
+                        page.keyboard.press("Escape")
+                        page.mouse.click(10, 10)
+                        page.wait_for_timeout(1000)
+
+                    else:
+                        print("  -> Fatura paga. Baixando direto...")
+                        
+                        for tentativa in range(3):
+                            try:
+                                with page.expect_download(timeout=15000) as informacoes_download:
+                                    linha_alvo.get_by_role("button", name=re.compile("Gerar 2ª via", re.IGNORECASE)).click(force=True)
+
+                                download = informacoes_download.value
+                                download.save_as(nome_arquivo)
+                                print(f"  -> Salvo: {nome_arquivo}")
+                                sucesso = True
+                                break 
+                            except Exception:
+                                print(f"  [AVISO] Servidor demorou ou falhou. Tentativa {tentativa + 2} de 3...")
+                                page.wait_for_timeout(2000) 
+
+                        if not sucesso:
+                            print(f"  [ERRO] Pulando a fatura de {mes} após 3 tentativas falhas.")
+
+                    if on_fatura_baixada:
+                        on_fatura_baixada(mes, sucesso)
+
+                    page.wait_for_timeout(1000)
+
+                except Exception as e:
+                    print(f"  [AVISO] A linha {i+1} não está visível ou a Celesc escondeu a paginação.")
+                    print("  -> Interrompendo a busca para salvar as faturas já baixadas.")
+                    break
 
             print("\n*** VERIFICAÇÃO CONCLUÍDA! ***")
 
@@ -374,4 +396,8 @@ if __name__ == "__main__":
     arg_senha = sys.argv[2]
     arg_uc = sys.argv[3]
 
-    baixar_faturas_celesc(arg_email, arg_senha, arg_uc)
+    try:
+        baixar_faturas_celesc(arg_email, arg_senha, arg_uc)
+    except Exception as e:
+        print(e)
+        sys.exit(1)
